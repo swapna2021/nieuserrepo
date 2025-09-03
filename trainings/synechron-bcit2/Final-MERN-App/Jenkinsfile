@@ -1,0 +1,86 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+  }
+
+  environment {
+    DOCKERHUB_REPO_API = "YOUR_DOCKERHUB_USERNAME/customer-api"
+    DOCKERHUB_REPO_WEB = "YOUR_DOCKERHUB_USERNAME/customer-web"
+    K8S_NAMESPACE      = "final-mern"
+    // a short tag from git (e.g., main-abc123)
+    IMAGE_TAG          = "${env.BRANCH_NAME}-${env.GIT_COMMIT.take(7)}"
+  }
+
+  triggers {
+    // If you can't expose Jenkins to GitHub webhooks, keep this:
+    pollSCM('H/5 * * * *')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'git rev-parse --short HEAD'
+      }
+    }
+
+    stage('Build & Push API') {
+      steps {
+        script {
+          docker.withRegistry('https://index.docker.io/v1/', 'dockerhub') {
+            sh """
+              docker build -t ${DOCKERHUB_REPO_API}:${IMAGE_TAG} ./customer-api
+              docker tag ${DOCKERHUB_REPO_API}:${IMAGE_TAG} ${DOCKERHUB_REPO_API}:latest
+              docker push ${DOCKERHUB_REPO_API}:${IMAGE_TAG}
+              docker push ${DOCKERHUB_REPO_API}:latest
+            """
+          }
+        }
+      }
+    }
+
+    stage('Build & Push WEB') {
+      steps {
+        script {
+          docker.withRegistry('https://index.docker.io/v1/', 'dockerhub') {
+            sh """
+              docker build -t ${DOCKERHUB_REPO_WEB}:${IMAGE_TAG} ./customer-web
+              docker tag ${DOCKERHUB_REPO_WEB}:${IMAGE_TAG} ${DOCKERHUB_REPO_WEB}:latest
+              docker push ${DOCKERHUB_REPO_WEB}:${IMAGE_TAG}
+              docker push ${DOCKERHUB_REPO_WEB}:latest
+            """
+          }
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        sh """
+          # Ensure namespace exists & manifests are applied (idempotent)
+          kubectl apply -f k8s --namespace=${K8S_NAMESPACE}
+
+          # Roll out new images (uses :latest or the commit tag; pick one)
+          kubectl -n ${K8S_NAMESPACE} set image deployment/customer-api \
+            customer-api=${DOCKERHUB_REPO_API}:${IMAGE_TAG}
+          kubectl -n ${K8S_NAMESPACE} set image deployment/customer-web \
+            customer-web=${DOCKERHUB_REPO_WEB}:${IMAGE_TAG}
+
+          # Wait for rollout to complete (fail pipeline if not healthy)
+          kubectl -n ${K8S_NAMESPACE} rollout status deployment/customer-api --timeout=120s
+          kubectl -n ${K8S_NAMESPACE} rollout status deployment/customer-web --timeout=120s
+        """
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'kubectl -n ${K8S_NAMESPACE} get pods'
+      sh 'kubectl -n ${K8S_NAMESPACE} get svc,ingress'
+    }
+  }
+}
